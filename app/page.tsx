@@ -37,7 +37,6 @@ export default function Home() {
     parsedFromBlock,
     parsedToBlock,
   );
-  console.log(messages);
 
   const stats = useMemo<MessageStats>(
     () => ({

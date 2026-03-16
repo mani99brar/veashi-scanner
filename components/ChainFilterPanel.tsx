@@ -148,24 +148,33 @@ function PanelHeader({
   );
 }
 
-function ChainSelect({
+// Export this from your ChainFilterPanel file, or move it to a shared components folder
+export function ChainSelect({
   label,
   value,
   options,
   onChange,
   disabled = false,
+  hideLabel = false,
+  hideBadge = false,
+  className = "",
 }: {
   label: string;
   value: ChainFilter;
   options: number[];
   onChange: (chain: ChainFilter) => void;
   disabled?: boolean;
+  hideLabel?: boolean;
+  hideBadge?: boolean;
+  className?: string;
 }) {
   return (
     <div className={disabled ? "opacity-50 pointer-events-none" : ""}>
-      <label className="text-xs font-semibold uppercase tracking-wider text-(--text-muted) mb-2 block">
-        {label}
-      </label>
+      {!hideLabel && (
+        <label className="text-xs font-semibold uppercase tracking-wider text-(--text-muted) mb-2 block">
+          {label}
+        </label>
+      )}
       <div className="relative">
         <select
           value={value.toString()}
@@ -174,11 +183,18 @@ function ChainSelect({
             onChange(val === NO_CHAIN ? NO_CHAIN : Number(val));
           }}
           disabled={disabled}
-          className="w-full px-4 py-2.5 bg-(--surface) border border-(--border) rounded-lg text-sm cursor-pointer focus:outline-none focus:ring-2 focus:ring-purple-600 focus:border-transparent transition-all appearance-none pr-10"
-          style={{ color: value === NO_CHAIN ? "var(--text-muted)" : "var(--text-primary)" }}
+          // Merge custom className for overrides, fallback to default styling if none provided
+          className={`appearance-none cursor-pointer focus:outline-none focus:ring-2 focus:ring-purple-600 focus:border-transparent transition-all pr-10 ${
+            className ||
+            "w-full px-4 py-2.5 bg-(--surface) border border-(--border) rounded-lg text-sm"
+          }`}
+          style={{
+            color:
+              value === NO_CHAIN ? "var(--text-muted)" : "var(--text-primary)",
+          }}
         >
           <option value={NO_CHAIN}>
-            {disabled ? "Select Source First" : "Select Chain"}
+            {disabled ? "Select Source First" : "All Chains"}
           </option>
           {options.map((chainId) => (
             <option key={chainId} value={chainId}>
@@ -188,12 +204,19 @@ function ChainSelect({
         </select>
         <svg
           className="absolute right-3 top-1/2 -translate-y-1/2 w-4 h-4 text-(--text-muted) pointer-events-none"
-          fill="none" viewBox="0 0 24 24" stroke="currentColor"
+          fill="none"
+          viewBox="0 0 24 24"
+          stroke="currentColor"
         >
-          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
+          <path
+            strokeLinecap="round"
+            strokeLinejoin="round"
+            strokeWidth={2}
+            d="M19 9l-7 7-7-7"
+          />
         </svg>
       </div>
-      {value !== NO_CHAIN && !disabled && (
+      {!hideBadge && value !== NO_CHAIN && !disabled && (
         <div className="mt-2">
           <ChainBadge chainId={value as number} />
         </div>
