@@ -8,6 +8,7 @@ import {
   NO_CHAIN,
   type ChainFilter,
 } from "@/components/ChainFilterPanel";
+import { findChainForTx } from "@/lib/utils";
 
 export default function SearchBar() {
   const [search, setSearch] = useState("");
@@ -23,19 +24,6 @@ export default function SearchBar() {
     }
   }, []);
 
-  // ─── Placeholder Function for Auto-Discovery ─────────────────────────────
-  const findChainForTx = async (hash: string): Promise<number | null> => {
-    console.log(
-      `[Placeholder] Attempting to auto-discover chain for tx: ${hash}`,
-    );
-
-    // Simulate network delay for the placeholder
-    // await new Promise((resolve) => setTimeout(resolve, 1500));
-
-    // TODO: Implement parallel RPC fetching here.
-    // Return the chainId if found, or null if it fails to find the transaction.
-    return null;
-  };
 
   const handleSearch = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -54,7 +42,7 @@ export default function SearchBar() {
         const foundChainId = await findChainForTx(trimmedHash);
 
         if (foundChainId) {
-          router.push(`/tx/${trimmedHash}?chainId=${foundChainId}`);
+          router.push(`/tx/${foundChainId}/${trimmedHash}`);
         }
       }
     } catch (error) {
