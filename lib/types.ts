@@ -47,3 +47,5 @@ export interface HashiMessage {
   reporters: string[];
   adapters: string[];
 }
+
+export type IconType = "route" | "address" | "threshold" | "info" | "bridge";
