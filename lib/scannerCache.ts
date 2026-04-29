@@ -4,6 +4,10 @@
  * Keyed by (sourceChainId, destChainId).  Persists to localStorage so results
  * survive page reloads.  Tracks exactly which block ranges have been scanned
  * so the scanner can skip them on subsequent runs.
+ *
+ * Invariant: for every block in `scannedRanges`, the cache contains every
+ * matching message that was ever found there.  This means eviction must drop
+ * scanned-range coverage alongside the messages, never silently.
  */
 
 import type { Message } from "@/lib/types";
@@ -16,6 +20,7 @@ export interface ScannedRange {
 }
 
 interface CacheEntry {
+  version: number;
   scannedRanges: ScannedRange[];
   messages: Message[];
   lastUpdated: number; // unix ms
@@ -24,12 +29,42 @@ interface CacheEntry {
 // ─── Constants ────────────────────────────────────────────────────────────────
 
 const CACHE_PREFIX = "veashi_v1_";
+const CACHE_VERSION = 2; // bumped: dedup is now by messageId instead of txHash
 
 /**
  * Cap on how many messages to retain per chain pair.
- * Oldest (lowest blockNumber) are evicted first.
+ * Oldest (lowest blockNumber) are evicted first, and `scannedRanges`
+ * is clamped to match so we don't claim coverage for blocks we've thrown away.
  */
 const MAX_CACHED_MESSAGES = 500;
+
+// ─── Internal helpers ─────────────────────────────────────────────────────────
+
+/** Normalize a tx hash for cross-provider comparison. */
+function normalizeHash(hash: string): string {
+  return hash.toLowerCase();
+}
+
+/**
+ * Stable unique key for a Hashi message.
+ *
+ * A single transaction can emit multiple MessageDispatched events (e.g. batch
+ * dispatches or contracts that call dispatchMessage more than once), so
+ * `txHash` alone is NOT unique.  Prefer Hashi's `messageId`.  Fall back to
+ * `txHash:nonce` for legacy cache entries that predate this fix.
+ */
+export function messageKey(m: Message): string {
+  if (m.messageId) return m.messageId.toLowerCase();
+  return `${normalizeHash(m.txHash)}:${m.nonce ?? 0}`;
+}
+
+let storageWarningEmitted = false;
+function warnStorageOnce(err: unknown): void {
+  if (storageWarningEmitted) return;
+  storageWarningEmitted = true;
+  // eslint-disable-next-line no-console
+  console.warn("[cache] localStorage write failed; cache disabled:", err);
+}
 
 // ─── Storage helpers ──────────────────────────────────────────────────────────
 
@@ -41,7 +76,11 @@ export function getCache(srcId: number, dstId: number): CacheEntry | null {
   if (typeof window === "undefined") return null;
   try {
     const raw = localStorage.getItem(storageKey(srcId, dstId));
-    return raw ? (JSON.parse(raw) as CacheEntry) : null;
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as CacheEntry;
+    // Drop entries from older schema versions rather than risk half-valid data.
+    if (parsed.version !== CACHE_VERSION) return null;
+    return parsed;
   } catch {
     return null;
   }
@@ -51,8 +90,9 @@ function setCache(srcId: number, dstId: number, entry: CacheEntry): void {
   if (typeof window === "undefined") return;
   try {
     localStorage.setItem(storageKey(srcId, dstId), JSON.stringify(entry));
-  } catch {
-    // Storage full or unavailable — silently skip.
+  } catch (err) {
+    // Storage full or unavailable — surface once so silent failures aren't invisible.
+    warnStorageOnce(err);
   }
 }
 
@@ -87,6 +127,23 @@ export function mergeRanges(ranges: ScannedRange[]): ScannedRange[] {
 }
 
 /**
+ * Clamp `ranges` so nothing extends below `minBlock`.  Used after eviction:
+ * if we no longer hold messages from blocks < minBlock, we must not claim
+ * those blocks were scanned.
+ */
+function clampRangesAbove(
+  ranges: ScannedRange[],
+  minBlock: number,
+): ScannedRange[] {
+  const out: ScannedRange[] = [];
+  for (const r of ranges) {
+    if (r.end < minBlock) continue;
+    out.push({ start: Math.max(r.start, minBlock), end: r.end });
+  }
+  return out;
+}
+
+/**
  * Return the sub-ranges of `desired` not yet covered by `cached`.
  * These are the block intervals that still need to be fetched from the chain.
  */
@@ -94,7 +151,8 @@ export function getUncachedSubranges(
   desired: ScannedRange,
   cached: ScannedRange[],
 ): ScannedRange[] {
-  // Only consider cached ranges that overlap the desired window.
+  if (desired.end < desired.start) return [];
+
   const relevant = mergeRanges(
     cached.filter((r) => r.end >= desired.start && r.start <= desired.end),
   );
@@ -121,17 +179,34 @@ export function getUncachedSubranges(
 // ─── Cache read helpers ───────────────────────────────────────────────────────
 
 /**
- * Search all cache entries for the given source chain and return the message
- * matching `txHash`, or null if not found.  Used by the tx-detail page to
- * avoid a network round-trip when the message was already loaded by the scanner.
+ * Search all cache entries for the given source chain and return the first
+ * message matching `txHash`, or null if not found.
+ *
+ * Note: a single tx can produce multiple messages — this returns whichever
+ * one is found first.  Callers needing all messages from a tx should use
+ * `findMessagesInCache`.
  */
 export function findMessageInCache(
   srcChainId: number,
   txHash: string,
 ): Message | null {
-  if (typeof window === "undefined") return null;
+  const matches = findMessagesInCache(srcChainId, txHash);
+  return matches[0] ?? null;
+}
+
+/**
+ * Search all cache entries for the given source chain and return ALL
+ * messages matching `txHash`.  Useful for tx-detail pages that need to
+ * display every message dispatched in a single transaction.
+ */
+export function findMessagesInCache(
+  srcChainId: number,
+  txHash: string,
+): Message[] {
+  if (typeof window === "undefined") return [];
   const prefix = `${CACHE_PREFIX}${srcChainId}_`;
-  const normalized = txHash.toLowerCase();
+  const normalized = normalizeHash(txHash);
+  const out: Message[] = [];
   try {
     for (let i = 0; i < localStorage.length; i++) {
       const key = localStorage.key(i);
@@ -139,15 +214,15 @@ export function findMessageInCache(
       const raw = localStorage.getItem(key);
       if (!raw) continue;
       const entry = JSON.parse(raw) as CacheEntry;
-      const found = entry.messages.find(
-        (m) => m.txHash.toLowerCase() === normalized,
-      );
-      if (found) return found;
+      if (entry.version !== CACHE_VERSION) continue;
+      for (const m of entry.messages) {
+        if (normalizeHash(m.txHash) === normalized) out.push(m);
+      }
     }
   } catch {
-    return null;
+    return out;
   }
-  return null;
+  return out;
 }
 
 /**
@@ -156,13 +231,16 @@ export function findMessageInCache(
 export function getCachedMessages(
   srcId: number,
   dstId: number,
-  range: ScannedRange,
+  range?: ScannedRange,
 ): Message[] {
   const entry = getCache(srcId, dstId);
   if (!entry) return [];
-  return entry.messages
-    .filter((m) => m.blockNumber >= range.start && m.blockNumber <= range.end)
-    .sort((a, b) => b.blockNumber - a.blockNumber);
+  const msgs = range
+    ? entry.messages.filter(
+        (m) => m.blockNumber >= range.start && m.blockNumber <= range.end,
+      )
+    : entry.messages;
+  return [...msgs].sort((a, b) => b.blockNumber - a.blockNumber);
 }
 
 // ─── Cache write helpers ──────────────────────────────────────────────────────
@@ -171,8 +249,11 @@ export function getCachedMessages(
  * Persist a newly-scanned chunk (range + its messages) into the cache.
  *
  * - Merges `newRange` into the existing scanned-ranges list.
- * - Deduplicates messages by txHash.
+ * - Deduplicates messages by `messageId` (or `txHash:nonce` fallback) so
+ *   batch dispatches in a single tx are all retained.
  * - Sorts newest-first and trims to MAX_CACHED_MESSAGES.
+ * - If trimming drops messages, clamps `scannedRanges` so we don't claim
+ *   coverage for blocks whose messages were evicted.
  *
  * Call this after every chunk (even empty ones) so we don't rescan them.
  */
@@ -183,28 +264,41 @@ export function updateCache(
   newMessages: Message[],
 ): void {
   const existing = getCache(srcId, dstId) ?? {
+    version: CACHE_VERSION,
     scannedRanges: [],
     messages: [],
     lastUpdated: 0,
   };
 
-  const mergedRanges = mergeRanges([...existing.scannedRanges, newRange]);
-
-  // Deduplicate by txHash (existing messages take precedence for metadata).
-  const seen = new Set<string>(existing.messages.map((m) => m.txHash));
+  // Deduplicate by messageId (existing messages take precedence).
+  const seen = new Set<string>(existing.messages.map(messageKey));
   const fresh = newMessages.filter((m) => {
-    if (seen.has(m.txHash)) return false;
-    seen.add(m.txHash);
+    const key = messageKey(m);
+    if (seen.has(key)) return false;
+    seen.add(key);
     return true;
   });
 
-  const allMessages = [...existing.messages, ...fresh]
-    .sort((a, b) => b.blockNumber - a.blockNumber)
-    .slice(0, MAX_CACHED_MESSAGES);
+  const combined = [...existing.messages, ...fresh].sort(
+    (a, b) => b.blockNumber - a.blockNumber,
+  );
+
+  const trimmed = combined.slice(0, MAX_CACHED_MESSAGES);
+  const droppedCount = combined.length - trimmed.length;
+
+  let mergedRanges = mergeRanges([...existing.scannedRanges, newRange]);
+
+  // If we evicted messages, clamp scanned-range coverage to the lowest
+  // block we still hold.  Anything below that becomes "unscanned" again.
+  if (droppedCount > 0 && trimmed.length > 0) {
+    const minRetainedBlock = trimmed[trimmed.length - 1].blockNumber;
+    mergedRanges = clampRangesAbove(mergedRanges, minRetainedBlock);
+  }
 
   setCache(srcId, dstId, {
+    version: CACHE_VERSION,
     scannedRanges: mergedRanges,
-    messages: allMessages,
+    messages: trimmed,
     lastUpdated: Date.now(),
   });
 }

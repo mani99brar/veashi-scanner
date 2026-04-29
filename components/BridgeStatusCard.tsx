@@ -1,3 +1,5 @@
+"use client";
+
 import { BridgeStatus } from '@/lib/types';
 
 const bridgeColors: Record<BridgeStatus['name'], { bg: string; text: string; border: string }> = {

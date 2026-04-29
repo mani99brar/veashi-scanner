@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useMemo } from "react";
+import { useState, useMemo, useEffect } from "react";
 import Header from "@/components/Header";
 import SearchBar from "@/components/SearchBar";
 import Pagination from "@/components/Pagination";
@@ -15,6 +15,18 @@ import { useDebounce } from "@/hooks/useDebounce";
 
 const ITEMS_PER_PAGE = 10;
 
+/**
+ * Parse user-typed block input into a non-negative integer or undefined.
+ * Returns undefined for empty / non-numeric / negative input so the hook
+ * doesn't try to BigInt(NaN), which throws.
+ */
+function parseBlockInput(value: string): number | undefined {
+  if (value === "") return undefined;
+  const n = Number(value);
+  if (!Number.isFinite(n) || n < 0) return undefined;
+  return Math.floor(n);
+}
+
 export default function Home() {
   const [currentPage, setCurrentPage] = useState(1);
   const [sourceChain, setSourceChain] = useState<ChainFilter>(NO_CHAIN);
@@ -26,10 +38,14 @@ export default function Home() {
   const debouncedFromBlock = useDebounce(fromBlock, 600);
   const debouncedToBlock = useDebounce(toBlock, 600);
 
-  const parsedFromBlock =
-    debouncedFromBlock !== "" ? Number(debouncedFromBlock) : undefined;
-  const parsedToBlock =
-    debouncedToBlock !== "" ? Number(debouncedToBlock) : undefined;
+  const parsedFromBlock = useMemo(
+    () => parseBlockInput(debouncedFromBlock),
+    [debouncedFromBlock],
+  );
+  const parsedToBlock = useMemo(
+    () => parseBlockInput(debouncedToBlock),
+    [debouncedToBlock],
+  );
 
   const { messages, isScanning, blockRange, error } = useMessageScanner(
     sourceChain,
@@ -57,12 +73,19 @@ export default function Home() {
 
   const hasActiveFilter = sourceChain !== NO_CHAIN || destChain !== NO_CHAIN;
 
+  const totalPages = Math.max(1, Math.ceil(messages.length / ITEMS_PER_PAGE));
+
+  // Clamp currentPage if the message list shrinks (e.g. mid-scan reset, or
+  // a re-scan that returns fewer results) so the user doesn't end up on a
+  // page that's now empty.
+  useEffect(() => {
+    if (currentPage > totalPages) setCurrentPage(totalPages);
+  }, [totalPages, currentPage]);
+
   const paginatedMessages = useMemo(() => {
     const startIndex = (currentPage - 1) * ITEMS_PER_PAGE;
     return messages.slice(startIndex, startIndex + ITEMS_PER_PAGE);
   }, [messages, currentPage]);
-
-  const totalPages = Math.max(1, Math.ceil(messages.length / ITEMS_PER_PAGE));
 
   const handleSourceChange = (chain: ChainFilter) => {
     setSourceChain(chain);

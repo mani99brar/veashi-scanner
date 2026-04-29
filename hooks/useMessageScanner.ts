@@ -16,6 +16,8 @@ import {
   getCache,
   getCachedMessages,
   getUncachedSubranges,
+  mergeRanges,
+  messageKey,
   updateCache,
   type ScannedRange,
 } from "@/lib/scannerCache";
@@ -25,27 +27,59 @@ import { getViemChain } from "@/lib/chains";
 
 const SCAN_WINDOW_BLOCKS = BigInt(1_000_000);
 const CHUNK_SIZE = BigInt(10_000);
-const MAX_NEW_MESSAGES = 10;
 
-/** * Helper to merge overlapping block ranges.
- * This ensures that if multiple destinations share a Yaho contract,
- * we union their missing ranges and only fetch from the RPC once.
+/**
+ * Per-route soft cap on newly-fetched (non-cached) messages we'll add to the
+ * displayed list before stopping further chunked scans for that route.
+ * Cached results are not counted against this cap.
  */
-function mergeRanges(ranges: ScannedRange[]): ScannedRange[] {
-  if (ranges.length === 0) return [];
-  const sorted = [...ranges].sort((a, b) => a.start - b.start);
-  const merged: ScannedRange[] = [sorted[0]];
+const MAX_NEW_MESSAGES_PER_ROUTE = 10;
 
-  for (let i = 1; i < sorted.length; i++) {
-    const last = merged[merged.length - 1];
-    const curr = sorted[i];
-    if (curr.start <= last.end + 1) {
-      last.end = Math.max(last.end, curr.end);
-    } else {
-      merged.push(curr);
+/** Normalize a tx hash for cross-provider comparison. */
+function normalizeHash(hash: string): string {
+  return hash.toLowerCase();
+}
+
+/**
+ * Merge a batch of new messages into existing state, deduplicating by
+ * messageKey (messageId or txHash:nonce fallback) and keeping the result
+ * sorted newest-first.
+ */
+function mergeMessages(prev: Message[], incoming: Message[]): Message[] {
+  if (incoming.length === 0) return prev;
+  const seen = new Set(prev.map(messageKey));
+  const fresh = incoming.filter((m) => !seen.has(messageKey(m)));
+  if (fresh.length === 0) return prev;
+  return [...prev, ...fresh].sort((a, b) => b.blockNumber - a.blockNumber);
+}
+
+/**
+ * Load all cached messages for the given chain filter synchronously from
+ * localStorage.  Returns them sorted newest-first.
+ */
+function loadAllCachedMessages(
+  sourceChain: ChainFilter,
+  destinationChain: ChainFilter,
+): Message[] {
+  const chainsToScan =
+    sourceChain === NO_CHAIN ? getAllSourceChains() : [sourceChain as number];
+
+  const all: Message[] = [];
+  for (const srcId of chainsToScan) {
+    const supportedDestinations = getDestinationChains(srcId);
+    const targetDestIds =
+      destinationChain === NO_CHAIN
+        ? supportedDestinations
+        : supportedDestinations.includes(destinationChain as number)
+          ? [destinationChain as number]
+          : [];
+
+    for (const dstId of targetDestIds) {
+      all.push(...getCachedMessages(srcId, dstId));
     }
   }
-  return merged;
+
+  return all.sort((a, b) => b.blockNumber - a.blockNumber);
 }
 
 // ─── Hook ─────────────────────────────────────────────────────────────────────
@@ -64,9 +98,6 @@ export function useMessageScanner(
   const abortRef = useRef<AbortController | null>(null);
 
   useEffect(() => {
-    // ── Guard ─────────────────────────────────────────────────────────────────
-    // If BOTH are specific chains but it's the exact same chain, we can abort.
-    // Otherwise, we allow fetching all sources/destinations.
     if (
       sourceChain !== NO_CHAIN &&
       destinationChain !== NO_CHAIN &&
@@ -77,21 +108,36 @@ export function useMessageScanner(
       return;
     }
 
-    // ── Determine which Source chains to scan ─────────────────────────────────
+    // Abort any in-progress scan immediately.
+    if (abortRef.current) abortRef.current.abort();
+    abortRef.current = new AbortController();
+    const signal = abortRef.current.signal;
+
+    // ── Step 1: Show cached messages synchronously, before any RPC call ──────
+    // localStorage reads are fast — this sets the visible list instantly on
+    // every filter/range change.  The scan below only merges NEW results on top.
+    const cached = loadAllCachedMessages(sourceChain, destinationChain);
+    setMessages(cached);
+
+    // ── Step 2: Scan for uncached blocks asynchronously ───────────────────────
+    setIsScanning(true);
+    setError(null);
+
     const chainsToScan =
       sourceChain === NO_CHAIN ? getAllSourceChains() : [sourceChain as number];
 
+    // displayRange filters newly-fetched logs before rendering them.
+    // Cached messages are always shown regardless of this range.
+    const displayRange: ScannedRange = {
+      start: fromBlock ?? 0,
+      end: toBlock ?? Number.MAX_SAFE_INTEGER,
+    };
+
     const scan = async () => {
-      if (abortRef.current) abortRef.current.abort();
-      abortRef.current = new AbortController();
-      const signal = abortRef.current.signal;
-
-      setIsScanning(true);
-      setError(null);
-      setMessages([]); // clear stale results immediately
-
       try {
         const scanPromises = chainsToScan.map(async (srcId) => {
+          if (signal.aborted) return;
+
           try {
             const chainConfig = getViemChain(srcId);
             if (!chainConfig) {
@@ -99,7 +145,6 @@ export function useMessageScanner(
               return;
             }
 
-            // ── Determine Target Destinations for this Source ────────────────
             const supportedDestinations = getDestinationChains(srcId);
             const targetDestIds =
               destinationChain === NO_CHAIN
@@ -108,14 +153,26 @@ export function useMessageScanner(
                   ? [destinationChain as number]
                   : [];
 
-            if (targetDestIds.length === 0) return; // No valid routes for this source
+            if (targetDestIds.length === 0) return;
 
             const publicClient = createPublicClient({
               chain: chainConfig,
               transport: http(),
             });
 
-            // ── Determine the desired scan window ────────────────────────────
+            // Build the yaho → destination-ids map
+            const yahoToDestIds = new Map<string, number[]>();
+            for (const dstId of targetDestIds) {
+              const yaho = getYaho(srcId, dstId);
+              if (yaho) {
+                const normalizedYaho = yaho.toLowerCase();
+                if (!yahoToDestIds.has(normalizedYaho))
+                  yahoToDestIds.set(normalizedYaho, []);
+                yahoToDestIds.get(normalizedYaho)!.push(dstId);
+              }
+            }
+
+            // ── Determine the scan range (what to fetch from RPC) ───────────
             let startBlock: bigint;
             let endBlock: bigint;
 
@@ -135,7 +192,16 @@ export function useMessageScanner(
                     : BigInt(1);
             }
 
-            const desiredRange: ScannedRange = {
+            if (signal.aborted) return;
+
+            if (endBlock < startBlock) {
+              console.warn(
+                `Invalid block range for chain ${srcId}: ${startBlock}-${endBlock}`,
+              );
+              return;
+            }
+
+            const scanRange: ScannedRange = {
               start: Number(startBlock),
               end: Number(endBlock),
             };
@@ -143,54 +209,24 @@ export function useMessageScanner(
             if (chainsToScan.length === 1) {
               setBlockRange({
                 chain: chainConfig.name,
-                start: desiredRange.start,
-                end: desiredRange.end,
-                windowSize: desiredRange.end - desiredRange.start,
+                start: scanRange.start,
+                end: scanRange.end,
+                windowSize: scanRange.end - scanRange.start,
               });
             } else {
               setBlockRange(null);
             }
 
-            // ── Serve Cached Messages & Group Yaho Contracts ─────────────────
-            const yahoToDestIds = new Map<string, number[]>();
-
-            for (const dstId of targetDestIds) {
-              // 1. Check cache and serve immediately
-              const cachedMessages = getCachedMessages(
-                srcId,
-                dstId,
-                desiredRange,
-              );
-              if (cachedMessages.length > 0) {
-                setMessages((prev) => {
-                  const seen = new Set(prev.map((m) => m.txHash));
-                  const fresh = cachedMessages.filter(
-                    (m) => !seen.has(m.txHash),
-                  );
-                  return [...prev, ...fresh].sort(
-                    (a, b) => b.blockNumber - a.blockNumber,
-                  );
-                });
-              }
-
-              // 2. Map Destinations to their Yaho Contract
-              const yaho = getYaho(srcId, dstId);
-              if (yaho) {
-                const normalizedYaho = yaho.toLowerCase();
-                if (!yahoToDestIds.has(normalizedYaho))
-                  yahoToDestIds.set(normalizedYaho, []);
-                yahoToDestIds.get(normalizedYaho)!.push(dstId);
-              }
-            }
-
             // ── Scan Uncached Ranges per Yaho Address (Deduplicated) ─────────
             for (const [yahoAddr, dstIdsForYaho] of yahoToDestIds.entries()) {
-              // Combine uncached ranges for all destinations sharing this contract
+              if (signal.aborted) break;
+
+              // Combine uncached ranges across destinations sharing this Yaho.
               const allUncached: ScannedRange[] = [];
               for (const dstId of dstIdsForYaho) {
                 const cacheEntry = getCache(srcId, dstId);
                 const uncached = getUncachedSubranges(
-                  desiredRange,
+                  scanRange,
                   cacheEntry?.scannedRanges ?? [],
                 );
                 allUncached.push(...uncached);
@@ -199,10 +235,13 @@ export function useMessageScanner(
               const mergedUncached = mergeRanges(allUncached);
               if (mergedUncached.length === 0) continue;
 
-              const rangesNewestFirst = mergedUncached.sort(
+              const targetDestSet = new Set(targetDestIds);
+
+              const rangesNewestFirst = [...mergedUncached].sort(
                 (a, b) => b.end - a.end,
               );
-              let totalNew = 0;
+
+              let newAddedForRoute = 0;
 
               outer: for (const subrange of rangesNewestFirst) {
                 let chunkEnd = BigInt(subrange.end);
@@ -220,7 +259,7 @@ export function useMessageScanner(
                   };
 
                   const rawLogs = await getMessageDispatchedLogs(
-                    yahoAddr as Address, // Use the grouped Yaho Address
+                    yahoAddr as Address,
                     chunkStart,
                     chunkEnd,
                     srcId,
@@ -228,24 +267,22 @@ export function useMessageScanner(
 
                   if (signal.aborted) break outer;
 
-                  const formatted: Message[] = rawLogs
-                    .sort((a, b) => b.blockNumber - a.blockNumber)
-                    .map((log) => ({
-                      txHash: log.txHash,
-                      sourceChain: srcId,
-                      destinationChain: log.message.targetChainId, // Explicit target from log
-                      thresholdRequired: log.message.threshold,
-                      thresholdCurrent: 0,
-                      sourceAddress: log.message.sender,
-                      destinationAddress: log.message.receiver,
-                      blockNumber: log.blockNumber,
-                      messageId: log.messageId,
-                      adapters: log.message.adapters,
-                      reporters: log.message.reporters,
-                      nonce: log.message.nonce,
-                    }));
+                  const formatted: Message[] = rawLogs.map((log) => ({
+                    txHash: normalizeHash(log.txHash),
+                    sourceChain: srcId,
+                    destinationChain: log.message.targetChainId,
+                    thresholdRequired: log.message.threshold,
+                    thresholdCurrent: 0,
+                    sourceAddress: log.message.sender,
+                    destinationAddress: log.message.receiver,
+                    blockNumber: log.blockNumber,
+                    messageId: log.messageId,
+                    adapters: log.message.adapters,
+                    reporters: log.message.reporters,
+                    nonce: log.message.nonce,
+                  }));
 
-                  // Distribute the logs to the correct destination cache
+                  // Persist to per-destination caches.
                   for (const dstId of dstIdsForYaho) {
                     const logsForDst = formatted.filter(
                       (m) => m.destinationChain === dstId,
@@ -253,27 +290,30 @@ export function useMessageScanner(
                     updateCache(srcId, dstId, chunkRange, logsForDst);
                   }
 
-                  // Only render logs for the destinations we actively care about
-                  const logsToDisplay = formatted.filter((m) =>
-                    targetDestIds.includes(m.destinationChain),
+                  // Render only logs whose destination matches the active filter
+                  // AND fall within the user's scan range (if any).
+                  const logsToDisplay = formatted.filter(
+                    (m) =>
+                      targetDestSet.has(m.destinationChain) &&
+                      m.blockNumber >= displayRange.start &&
+                      m.blockNumber <= displayRange.end,
                   );
 
                   if (logsToDisplay.length > 0) {
+                    const remaining =
+                      MAX_NEW_MESSAGES_PER_ROUTE - newAddedForRoute;
                     const toAdd = logsToDisplay.slice(
                       0,
-                      MAX_NEW_MESSAGES - totalNew,
+                      Math.max(0, remaining),
                     );
-                    setMessages((prev) => {
-                      const seen = new Set(prev.map((m) => m.txHash));
-                      const fresh = toAdd.filter((m) => !seen.has(m.txHash));
-                      return [...prev, ...fresh].sort(
-                        (a, b) => b.blockNumber - a.blockNumber,
-                      );
-                    });
-                    totalNew += toAdd.length;
+                    if (toAdd.length > 0) {
+                      setMessages((prev) => mergeMessages(prev, toAdd));
+                      newAddedForRoute += toAdd.length;
+                    }
                   }
 
-                  if (totalNew >= MAX_NEW_MESSAGES) break outer;
+                  if (newAddedForRoute >= MAX_NEW_MESSAGES_PER_ROUTE)
+                    break outer;
 
                   chunkEnd = chunkStart - BigInt(1);
                   await new Promise((r) => setTimeout(r, 500)); // Rate limit buffer
